@@ -1,0 +1,23 @@
+Package: geoDBapi
+Title: Geo DB cities API wrappers
+Version: 0.0.0.9000
+Author: Andre Gnandt <gnandtandre@outlook.com>
+Maintainer: Andre Gnandt <gnandtandre@outlook.com>
+Description: Package for using the GEO DB cities api.
+License: MIT + file LICENSE
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.3.2
+Imports: 
+    countrycode,
+    httr,
+    jsonlite,
+    methods,
+    stringr,
+    tidygeocoder
+Suggests: 
+    knitr,
+    rmarkdown,
+    testthat (>= 3.0.0)
+Config/testthat/edition: 3
+VignetteBuilder: knitr

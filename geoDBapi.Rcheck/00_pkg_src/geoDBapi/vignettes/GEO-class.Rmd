@@ -1,0 +1,33 @@
+---
+title: "GEO-class"
+author: "Andre Gnandt"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# Parameters
+## namePrefix vs name:
+Both of these parameters are optional.  
+The namePrefix parameter will only be used (to find records matching by namePrefix) if the name parameter is null. In other words, if you provide a value for the name parameter then this parameter takes priority over the namePrefix parameter and the namePrefix parameter is then ignored. For example if you proivde name = "San" and namePrefix = "S" then only records with an exact matching name of San will be retrieved.  
+  
+## placeName, placeId, and placeAddress (conditionally required)
+Either a placeId, or a placeAddress, or a placeName is required.  
+PlaceId is the dominant parameter and takes priority over the other 2. If placeId is passed a value then place Id is used for the query, and both placeAddress and placeName are ignored. If placeId is null then the best matching wikidataId for the placeAddress and placeName  used in combination is used to identify a place.  
+  
+## locationAddress, longitude and latitude 
+longitude and latitude are the dominant parameters and take priority for identifying a location over the locationAddress parameter. Both longitude and latitude need to be passed values to be used for identifying a place, otherwise locationAddress will be used (if locationAddress is not null). If none, or only one value is passed to only one of longitude or latitude then these 2 parameters are ignored, and location address is used.  
+  
+## countryId and country (conditionally required)
+One of these is required (one must not be null)  
+countryId takes priority over country, the country param is ignored if countryId is passed a value. The country param is only used if countryID is null.  
+  
+## regionId and region (conditionally required)
+One of these parameters is required (at least one must not be null)  
+regionId takes priority over region, the region param is ignored if regionId is passed a value. The region param is only used if regionId is null.  
+  
+## toId, toName and toAddress (Conditionally required)
+Either a toId, or a toAddress, or a toName is required.  
+toId is the dominant parameter and takes priority over the other 2. If toId is passed a value then toId is used for the query, and both toAddress and toName are ignored. If toId is null then the best matching wikidataId for the toAddress and toPlace is used in combination to identify a place.  
+  
+## fromId, fromName and fromAddress (Conditionally required)
+Works the same as toId, toName and toAddress
