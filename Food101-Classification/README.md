@@ -1,4 +1,3 @@
-# DATA 586 Group Project – Group 1
 This project compares different fine-tuning methods for Food101 image classification using ResNet18 and EfficientNetV2-S. We test the models on the clean test set and the transformed test splits.
 
 ## Group 1 Members:
