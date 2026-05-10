@@ -1,0 +1,89 @@
+\documentclass[12pt]{article}
+\usepackage{graphicx}
+\usepackage{setspace}
+\usepackage{geometry}
+\usepackage{hyperref}
+\usepackage{booktabs}
+
+% Margins
+\geometry{a4paper, margin=1in}
+
+% Double spacing
+\doublespacing
+
+\title{Titanic Survival Prediction Using Supervised Machine Learning}
+\author{DATA 572 Group Project}
+\date{February 2026}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+This project explores the application of supervised machine learning techniques to predict passenger survival on the Titanic. Utilizing an augmented dataset, we implemented and evaluated three core classification algorithms: Logistic Regression, Random Forest, and K-Nearest Neighbors (KNN), along with a supplementary Deep Learning Transformer model. The primary objective was to construct efficient models that maximize predictive performance while minimizing feature complexity. Our methodology involved rigorous data preprocessing, including median imputation for missing values and stratified resampling to maintain class distribution. Through extensive hyperparameter tuning using GridSearchCV, we optimized each model's performance. The experimental results indicate that the K-Nearest Neighbors model achieved the highest classification accuracy on the test set, effectively capturing the local structure of the passenger data. Feature importance analysis across models consistently highlighted gender and socio-economic status as the most critical determinants of survival. This report details the complete pipeline from exploratory data analysis to final model selection, demonstrating the efficacy of supervised learning in extracting actionable insights from historical data.
+\end{abstract}
+
+\section{Introduction}
+Supervised machine learning has become a cornerstone of modern data analysis, providing powerful tools for classification tasks across diverse domains. In this project, we apply these methods to the classic Titanic dataset to predict passenger survival. The binary classification problem—determining survival (1) or non-survival (0)—serves as an excellent benchmark for comparing different algorithmic approaches.
+
+The ability to accurately classify outcomes based on demographic and structural features is critical in fields ranging from healthcare to finance. By analyzing the Titanic dataset, which includes attributes such as age, sex, passenger class, and fare, we aim to understand not just \textit{who} survived, but \textit{why} specific features hold predictive power. Our study focuses on building interpretable and performant models, emphasizing the trade-off between model complexity and accuracy.
+
+\section{Methodology}
+Our approach followed a structured data science pipeline: preprocessing, feature engineering, model selection, and evaluation.
+
+\subsection{Data Preprocessing}
+The dataset required significant cleaning to ensure quality input for the models. We identified and removed arbitrary columns such as \texttt{PassengerId}, \texttt{Name}, and \texttt{Ticket} which offered no generalizable predictive value. Categorical variables were handled carefully: \texttt{Sex} was binary encoded, while \texttt{Embarked} and \texttt{Pclass} underwent One-Hot Encoding to prevent ordinal assumptions where none existed.
+
+To address missing data, we employed median imputation for the \texttt{Age} feature. This method was chosen over mean imputation to minimize the influence of outliers. Missing \texttt{Embarked} values were imputed with the mode. Furthermore, numerical features were scaled using \texttt{StandardScaler} to ensure that distance-based algorithms like KNN were not biased by feature magnitude.
+
+\subsection{Data Splitting and Resampling}
+To evaluate our models robustly, we split the dataset into training (75\%) and testing (25\%) sets. Crucially, we used \textbf{stratified splitting} based on the target variable \texttt{Survived}. This technique maintains the original class distribution in both subsets, preventing bias arising from class imbalance. For resampling during the tuning phase, we utilized 5-fold Cross-Validation, ensuring that our hyperparameter choices generalized well across different data subsets.
+
+\subsection{Model Building and Feature Engineering}
+We addressed the issue of multicollinearity by analyzing the correlation matrix and removing redundant features such as \texttt{Fare} (highly correlated with \texttt{Pclass} and \texttt{fare\_per\_person}). Feature selection was further refined by analyzing model coefficients and permutation importance, reducing our input dimension from 13 to approximately 5-12 key features depending on the model.
+
+We selected three primary algorithms:
+\begin{itemize}
+    \item \textbf{Logistic Regression:} A robust linear baseline.
+    \item \textbf{Random Forest:} An ensemble method capable of capturing non-linear relationships.
+    \item \textbf{K-Nearest Neighbors (KNN):} A distance-based classifier.
+\end{itemize}
+Additionally, we implemented a \textbf{Transformer} neural network as a bonus investigation into deep learning applicability for tabular data.
+
+\section{Experiment}
+
+\subsection{Experimental Design}
+Each model underwent hyperparameter tuning using \texttt{GridSearchCV} to optimize performance metrics.
+\begin{itemize}
+    \item \textbf{Logistic Regression:} We tuned the regularization parameter $C$ and solver type. The optimal configuration was found to be $C=0.1$ with L2 regularization, preventing overfitting.
+    \item \textbf{Random Forest:} We explored the number of estimators, maximum depth, and split criteria. The best model used 200 estimators with specific constraints on lead nodes to control model complexity.
+    \item \textbf{KNN:} We optimized the number of neighbors ($k$) and the distance metric. A $k$ value of 15 with the Manhattan distance metric yielded the best stability.
+    \item \textbf{Transformer:} We experimented with dropout rates, learning rates, and layer dimensions to adapt the architecture for this specific dataset size.
+\end{itemize}
+
+\subsection{Results and Analysis}
+The K-Nearest Neighbors model demonstrated superior performance on the held-out test set, achieving the highest accuracy. This suggests that the decision boundary for survival has a local structure best captured by proximity in the feature space rather than global linear separators or axis-aligned splits.
+
+Logistic Regression provided a strong baseline with high interpretability. Feature coefficient analysis confirmed that being female and having a higher socio-economic status (First Class) were the strongest positive predictors of survival.
+
+The Random Forest model initially showed signs of overfitting, achieving near-perfect training accuracy but lower test scores. Through tuning \texttt{min\_samples\_leaf} and \texttt{max\_depth}, we successfully regularized the model, though it did not surpass KNN in final testing.
+
+Comparison with the Transformer model revealed an important insight: deep learning architectures typically require larger datasets to outperform classical machine learning methods. On this smaller tabular dataset, the Transformer struggled to learn generalizable patterns as effectively as the simpler KNN algorithm.
+
+\section{Conclusion}
+This project successfully implemented a comprehensive supervised learning workflow to predict Titanic survival. By rigorously preprocessing data, handling missing values with median imputation, and employing stratified resampling, we ensured a robust evaluation framework.
+
+Our key finding is that K-Nearest Neighbors serves as the most effective classifier for this specific task, outperforming both linear and ensemble tree-based methods. The analysis justified the importance of feature selection, showing that a compact set of features centered on demographics and class can yield high-performance models. The experiments highlighted the "No Free Lunch" theorem, demonstrating that state-of-the-art deep learning methods like Transformers are not automatically superior for all data types and scales.
+
+\begin{thebibliography}{9}
+\bibitem{sklearn}
+Pedregosa, F., et al. (2011). Scikit-learn: Machine Learning in Python. \textit{Journal of Machine Learning Research}, 12, 2825-2830.
+
+\bibitem{titanic}
+Data Science Dojo. (n.d.). Titanic Dataset. GitHub Repository.
+
+\bibitem{paszke}
+Paszke, A., et al. (2019). PyTorch: An Imperative Style, High-Performance Deep Learning Library. \textit{Advances in Neural Information Processing Systems}, 32.
+\end{thebibliography}
+
+\end{document}
