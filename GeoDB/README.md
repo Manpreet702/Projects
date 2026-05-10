@@ -1,11 +1,3 @@
-![CI](https://github.com/andre-gnandt/DATA-534-Project-Group-6/actions/workflows/R-CI.yml/badge.svg)  
-  
-# DATA-534-Project-Group-6
-## Members:  
-### Andre Gnandt 
-### Yihang Wang 
-### Manpreet Singh  
-  
 # Notebook/Diaries
 See folder /Diaries-Notebooks  
   
