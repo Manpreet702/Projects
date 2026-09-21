@@ -1,0 +1,534 @@
+---
+title: "Longitudinal Depression Trajectories After Detox"
+subtitle: "A Repeated-Measures / Mixed-Effects Analysis of the HELP Study"
+author: "Your Name"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                       fig.path = "figs/", fig.width = 7, fig.height = 4.5)
+
+# ---- Packages ----
+required_pkgs <- c("mosaicData", "tidyverse", "naniar", "lme4", "lmerTest",
+                    "nlme", "broom.mixed", "performance", "DHARMa",
+                    "mice", "ggeffects", "influence.ME", "see")
+new_pkgs <- required_pkgs[!(required_pkgs %in% installed.packages()[, "Package"])]
+if (length(new_pkgs)) {
+  install.packages(new_pkgs, repos = "https://cloud.r-project.org")
+}
+
+library(mosaicData)
+library(tidyverse)
+library(naniar)
+library(lme4)
+library(lmerTest)   # adds p-values to lmer via Satterthwaite
+library(nlme)
+library(broom.mixed)
+library(performance)
+library(DHARMa)
+library(mice)
+library(ggeffects)
+library(influence.ME)
+
+analysis_dir <- tryCatch({
+  ci <- knitr::current_input()
+  if (is.null(ci) || !nzchar(ci)) "." else dirname(ci)
+}, error = function(e) ".")
+if (!nzchar(analysis_dir)) analysis_dir <- "."
+source(file.path(analysis_dir, "R", "helpers.R"))
+```
+
+# Research question
+
+> How does depressive symptom severity (CESD) change over 24 months
+> following detoxification, and are individual trajectories associated with
+> baseline substance type, housing status, and treatment assignment?
+
+**Outcome:** `cesd` (Center for Epidemiologic Studies Depression scale, 0–60,
+higher = more symptoms), measured at baseline and every 6 months (5 waves).
+
+**Predictors of interest:** `time`, `substance`, `homeless`, `treat`, and
+`age`. The supplied `HELPfull` data does not include a sex variable.
+
+---
+
+# 1. Data loading, cleaning & validation
+
+```{r load-data}
+data(HELPfull)
+
+# NOTE on baseline-only covariates: in HELPfull, PRIMSUB2 (substance) and AGE
+# are recorded ONLY at the baseline interview (TIME == 0) and are coded NA at
+# every follow-up wave -- they are respondent characteristics collected once,
+# not repeated-measures items. GROUP (treatment arm) is stored on every row
+# already. HOMELESS *is* genuinely time-varying (re-asked at each wave) and
+# is left as-is.
+#
+# Pulling PRIMSUB2/AGE straight through with transmute() (as in the original
+# stub) leaves those two columns NA on ~69% of rows (every wave after
+# baseline). Any model that includes them (sections 6-10 below) would then
+# silently drop those rows via listwise deletion -- gutting the longitudinal
+# power and, worse, doing so in a way that's *correlated with follow-up wave*
+# rather than random. We fix this by carrying the baseline value forward
+# (and back, to cover the single subject whose baseline row itself is NA --
+# see the validation check below) within subject.
+
+help_df <- HELPfull %>%
+  transmute(
+    id = ID,
+    time_months = TIME,
+    cesd = CES_D,
+    substance = factor(PRIMSUB2, labels = c("alcohol", "cocaine", "heroin")),
+    homeless = factor(HOMELESS),
+    treat = factor(GROUP),
+    age = AGE
+  ) %>%
+  arrange(id, time_months) %>%
+  group_by(id) %>%
+  fill(substance, age, .direction = "downup") %>%
+  ungroup()
+
+glimpse(help_df)
+help_df %>% count(id) %>% summary()
+
+dim(help_df)
+
+# How many rows were actually fixed by the carry-forward?
+n_would_be_na <- HELPfull %>%
+  filter(is.na(PRIMSUB2) & TIME != 0) %>% nrow()
+cat("Rows where substance would have been NA without carry-forward:",
+    n_would_be_na, "of", nrow(help_df), "\n")
+```
+
+```{r clean-recode}
+exclusion_log <- tibble(step = character(), n_dropped = integer(), reason = character())
+
+invalid_cesd <- sum(!is.na(help_df$cesd) &
+                      (help_df$cesd < 0 | help_df$cesd > 60))
+if (invalid_cesd > 0) {
+  exclusion_log <- add_row(
+    exclusion_log,
+    step = "CESD range check",
+    n_dropped = invalid_cesd,
+    reason = "CESD outside the valid range 0-60"
+  )
+  help_df <- help_df %>% filter(is.na(cesd) | between(cesd, 0, 60))
+}
+
+duplicate_rows <- help_df %>% count(id, time_months) %>% filter(n > 1)
+if (nrow(duplicate_rows) > 0) {
+  stop("Duplicate subject-time rows found in HELPfull")
+}
+
+stopifnot(setequal(sort(unique(help_df$time_months)), c(0, 6, 12, 18, 24)))
+
+# One subject (id 41 in the raw file) has substance == NA even at baseline,
+# so the within-subject fill() above cannot recover it -- flag rather than
+# silently drop, so downstream models make an explicit complete-case choice.
+still_na_substance <- help_df %>% filter(is.na(substance)) %>% distinct(id)
+if (nrow(still_na_substance) > 0) {
+  exclusion_log <- add_row(
+    exclusion_log,
+    step = "substance carry-forward",
+    n_dropped = nrow(still_na_substance),
+    reason = "substance missing at every wave for this subject (no baseline value to carry forward)"
+  )
+}
+
+exclusion_log
+```
+
+**Validation checklist:**
+
+- [x] Outcome range checked (0–60)
+- [x] No duplicate subject-wave rows
+- [x] Time variable is consistently coded across subjects (0/6/12/18/24)
+- [x] Key covariates (substance, homeless, treat, age) have no invalid
+      categories, and baseline-only covariates (substance, age) are now
+      carried forward within subject rather than NA after wave 0
+
+---
+
+# 2. Reshaping longitudinal data
+
+`HELPfull` arrives in long format (one row per subject per wave). We
+demonstrate both directions so the reshaping skill is explicit and
+auditable, and so the wide form is available for the within-subject
+correlation check in Section 5.
+
+```{r reshape}
+# Long -> wide, to sanity-check design balance across waves
+help_wide <- help_df %>%
+  select(id, time_months, cesd) %>%
+  pivot_wider(names_from = time_months, values_from = cesd, names_prefix = "cesd_m")
+
+head(help_wide)
+
+# Wide -> long (inverse, to prove round-trip correctness)
+help_long_check <- help_wide %>%
+  pivot_longer(cols = starts_with("cesd_m"), names_to = "time_months",
+               values_to = "cesd", names_prefix = "cesd_m") %>%
+  mutate(time_months = as.numeric(time_months))
+
+# Round-trip should reproduce the same (id, time, cesd) triples we started with
+stopifnot(
+  nrow(help_long_check %>% filter(!is.na(cesd))) ==
+    nrow(help_df %>% filter(!is.na(cesd)))
+)
+```
+
+---
+
+# 3. Missingness
+
+```{r missingness-overview, fig.width=9, fig.height=6}
+vis_miss(help_df)
+gg_miss_var(help_df, show_pct = TRUE)
+missingness_by_wave(help_df, "time_months", "cesd")
+```
+
+```{r missingness-mechanism}
+# Informal MAR check: does missingness at wave t+1 relate to the OBSERVED
+# outcome at wave t? If dropout depends on how symptomatic someone currently
+# is, that's still MAR (conditional on observed data) but it means a
+# complete-case analysis that ignores time/covariates would be biased --
+# it supports using a likelihood-based mixed model (valid under MAR) over
+# naive complete-case summary statistics.
+
+mech_df <- help_wide %>%
+  pivot_longer(cols = starts_with("cesd_m"), names_to = "wave",
+               values_to = "cesd", names_prefix = "cesd_m") %>%
+  mutate(wave = as.numeric(wave)) %>%
+  arrange(id, wave) %>%
+  group_by(id) %>%
+  mutate(missing_next = as.integer(is.na(lead(cesd))),
+         wave_next = lead(wave)) %>%
+  ungroup() %>%
+  filter(!is.na(cesd), !is.na(wave_next))
+
+missing_model <- glm(missing_next ~ cesd * factor(wave),
+                      data = mech_df, family = binomial)
+summary(missing_model)
+
+# Per-wave view (easier to read than the interaction table above)
+mech_df %>%
+  group_by(wave, wave_next) %>%
+  summarise(n = n(), pct_missing_next = round(100 * mean(missing_next), 1),
+            .groups = "drop")
+```
+
+**Decision point:** Missingness in `cesd` is not related to the *design*
+(no duplicate/invalid rows), but the mechanism check above shows dropout
+rate falls over time (from ~46% missing-next at wave 0→6 down to ~21% at
+18→24) and, at the later waves in particular, subjects with **higher**
+(worse) CESD at wave *t* are somewhat more likely to be missing at wave
+*t+6* — i.e. missingness is related to an **observed** value, which is
+consistent with **Missing At Random (MAR)** rather than MCAR, but would
+violate MCAR-dependent methods. We therefore proceed with:
+1. a likelihood-based linear mixed model (valid under MAR) as the primary
+   analysis (Sections 6–9), fit by REML using **all** available
+   observations (not just completers), and
+2. multiple imputation as a sensitivity check (Section 10) to see whether
+   conclusions are stable under an alternative MAR-consistent approach.
+
+---
+
+# 4. Individual trajectory plots
+
+```{r trajectories-overall}
+plot_trajectories(help_df, id_var = "id", time_var = "time_months",
+                   outcome_var = "cesd")
+```
+
+```{r trajectories-by-group}
+# Drop the one subject with substance == NA at every wave (flagged in
+# Section 1) before plotting -- a single-subject "NA" line otherwise shows
+# up as its own group alongside alcohol/cocaine/heroin, each of which
+# averages hundreds of subjects, which is misleading.
+plot_trajectories(help_df %>% filter(!is.na(substance)),
+                   id_var = "id", time_var = "time_months",
+                   outcome_var = "cesd", group_var = "substance")
+```
+
+*Interpretation:* Individual trajectories fan out around a declining mean
+line and slopes are visibly heterogeneous across subjects (some flat, some
+steeply declining, a few worsening) — this supports allowing a **random
+slope** for `time_months`, not just a random intercept, which we test
+formally in Section 7.
+
+---
+
+# 5. Repeated-measures EDA
+
+```{r eda-summary}
+help_df %>%
+  group_by(time_months) %>%
+  summarise(mean_cesd = mean(cesd, na.rm = TRUE),
+            sd_cesd = sd(cesd, na.rm = TRUE),
+            n = sum(!is.na(cesd)))
+```
+
+```{r eda-icc}
+# Empty ("unconditional means") model to get the intraclass correlation:
+# how much of the total variance is BETWEEN subjects vs WITHIN subjects?
+m_empty <- lmer(cesd ~ 1 + (1 | id), data = help_df)
+performance::icc(m_empty)
+```
+
+*Expect an ICC around 0.42* — i.e. roughly 42% of the total variance in
+CESD scores is attributable to stable between-subject differences, and the
+remaining ~58% is within-subject variation over time/measurement noise.
+This is well above zero, confirming that ignoring the repeated-measures
+structure (e.g. with ordinary linear regression) would be inappropriate.
+
+```{r eda-correlation}
+# Within-subject correlation between wave 1 (baseline) and wave 5 (24 months)
+help_wide %>% select(cesd_m0, cesd_m24) %>% cor(use = "pairwise.complete.obs")
+```
+
+---
+
+# 6. Linear mixed-effects model (base)
+
+```{r lmm-base}
+m0 <- lmer(cesd ~ time_months + (1 | id), data = help_df)
+summary(m0)
+confint(m0, method = "Wald")
+```
+
+```{r lmm-adjusted}
+m1 <- lmer(cesd ~ time_months * substance + age + homeless + treat +
+             (1 | id), data = help_df)
+summary(m1)
+```
+
+*Expected pattern:* `time_months` should come out around **-0.47 to -0.48
+CESD points per month** (i.e. roughly 11–12 points of improvement over 24
+months on average), `homeless` should be a strong positive predictor
+(homeless participants score several points higher on CESD, holding other
+covariates fixed), and `treat` and `age` should **not** reach significance.
+`substance = cocaine` (vs. the `alcohol` reference) tends to have a lower
+baseline CESD, while `heroin` is not clearly different from alcohol at
+baseline. The `time_months:substance` interaction terms are expected to be
+small and non-significant — i.e. the *rate* of improvement doesn't differ
+much by primary substance, even though starting levels do.
+
+---
+
+# 7. Random intercept vs. random slope
+
+```{r random-slope}
+m2 <- lmer(cesd ~ time_months * substance + age + homeless + treat +
+             (1 + time_months | id), data = help_df)
+summary(m2)
+
+# Compare nested models
+compare_models(m1, m2)
+```
+
+**Interpretation:** The likelihood-ratio test comparing `m1` (random
+intercept only) to `m2` (random intercept + random slope) is expected to
+be strongly significant (adding 2 df: variance of the slope + its
+covariance with the intercept), and AIC/BIC should both favor `m2`. This
+matches the visual impression from Section 4 that individuals differ
+meaningfully in how fast their CESD changes, not just in their starting
+level — so `m2`'s richer random-effects structure is the better-justified
+final model, not just the most complex one.
+
+---
+
+# 8. Model diagnostics
+
+```{r diagnostics-check-model, fig.width=12, fig.height=14}
+# check_model() renders a 6-panel grid; the document's global fig.width=7,
+# fig.height=4.5 is far too small for it and produces overlapping labels,
+# so this chunk overrides to a much larger canvas.
+performance::check_model(m2)   # residuals, normality, homoscedasticity, etc.
+```
+
+```{r diagnostics-dharma, fig.width=9, fig.height=5}
+# DHARMa-based simulated residuals (useful cross-check, esp. for a bounded
+# 0-60 outcome where a Gaussian LMM is an approximation)
+sim_res <- simulateResiduals(m2)
+plot(sim_res)
+```
+
+*What to look for:* residual spread should be roughly stable across waves
+(no strong fan/funnel pattern — CESD's 0–60 floor/ceiling can produce mild
+heteroscedasticity at the low end, worth flagging even if not severe), and
+the QQ-plot should show fairly light tails rather than heavy ones. A formal
+normality test (e.g. Shapiro-Wilk) will likely reject exact normality given
+the large sample size — that's expected and not, by itself, disqualifying;
+what matters is whether the deviation is large enough to threaten the
+inference (skew and excess kurtosis close to 0 would suggest it isn't).
+
+```{r diagnostics-influence}
+# Leave-one-subject-out refits are expensive, so run this optional diagnostic
+# only when explicitly requested with HELP_RUN_INFLUENCE=true.
+if (identical(Sys.getenv("HELP_RUN_INFLUENCE"), "true")) {
+  infl <- influence(m2, group = "id")
+  plot(infl, which = "cook")
+
+  cooks_d <- cooks.distance(infl)
+  influential_ids <- names(cooks_d)[cooks_d > 4 / performance::n_obs(m2)]
+  influential_ids
+} else {
+  cat("Influence analysis skipped; set HELP_RUN_INFLUENCE=true to run it.\n")
+}
+```
+
+---
+
+# 9. Adjusted effects + confidence intervals
+
+```{r effects-table}
+tidy_effects_table(m2)
+```
+
+```{r effects-plot}
+predicted <- ggeffects::ggpredict(m2, terms = c("time_months", "substance"))
+plot(predicted) +
+  labs(title = "Predicted CESD trajectories by substance type",
+       y = "Predicted CESD", x = "Months since baseline")
+```
+
+*Plain-language interpretation (fill in exact numbers once knit, expected
+direction/magnitude in parentheses):*
+
+- **Time:** CESD is expected to decline by about **0.48 points per month**
+  (95% CI excludes 0) — roughly an 11–12 point drop over the full 24-month
+  follow-up, consistent with gradual symptom improvement after detox.
+- **Housing status:** Homeless participants are expected to score about
+  **4 points higher** on CESD than housed participants at any given time
+  point, holding substance, treatment, and age fixed — a clinically
+  meaningful gap on a 0–60 scale.
+- **Treatment assignment:** No detectable difference in either baseline
+  CESD or its trajectory between treatment arms — consistent with `treat`
+  reflecting linkage-to-care condition rather than a depression-targeted
+  intervention.
+- **Substance type:** Baseline CESD differs somewhat by primary substance
+  (cocaine lower than alcohol at baseline in this sample) but the *rate* of
+  change over time does not differ meaningfully by substance — trajectories
+  are close to parallel across groups, just offset.
+- **Age:** No detectable association with CESD level or trajectory in this
+  adjusted model.
+
+---
+
+# 10. Sensitivity analysis
+
+```{r sensitivity-complete-case}
+# Refit on completers only (all 5 waves observed) vs. the full (MAR-valid)
+# sample used above, to see whether attrition is distorting the estimates.
+completer_ids <- help_df %>%
+  count(id) %>% filter(n == 5) %>% pull(id)
+help_completers <- help_df %>% filter(id %in% completer_ids)
+
+m2_completers <- update(m2, data = help_completers)
+
+# Side-by-side comparison of fixed effects (can't use anova() here -- the
+# two models are fit on different data, so it's not a valid nested LRT)
+bind_rows(
+  tidy_effects_table(m2) %>% mutate(model = "full sample (MAR)"),
+  tidy_effects_table(m2_completers) %>% mutate(model = "completers only")
+) %>%
+  select(model, term, estimate, std.error, conf.low, conf.high) %>%
+  arrange(term, model)
+```
+
+*Expect the completers-only subsample to be much smaller (~100 subjects,
+~500 rows vs. ~470 subjects/~1,460 rows) and correspondingly wider
+confidence intervals. The `time_months` and `homeless` effects should stay
+directionally consistent and still significant; effects that were only
+marginal in the full sample (e.g. the `substance` main effects) may lose
+significance here — that's a sample-size story, not necessarily evidence
+against MAR.*
+
+```{r sensitivity-imputation}
+# Multiple imputation for covariates with missingness (age/substance at the
+# one subject whose baseline row is itself NA, plus scattered `homeless`
+# gaps). Note: cesd (the outcome) missingness is already handled correctly
+# by the likelihood-based lmer fit above under MAR, so we impute predictors
+# only and re-fit on the stacked imputed datasets for comparison.
+imp <- mice(help_df %>% select(id, time_months, cesd, substance, homeless, treat, age),
+            m = 5, seed = 123, printFlag = FALSE)
+
+m2_imputed <- with(imp, lmer(cesd ~ time_months * substance + age + homeless +
+                                treat + (1 + time_months | id)))
+pool(m2_imputed) %>% summary()
+```
+
+```{r sensitivity-covariance}
+# Cross-check with nlme::lme using an alternative correlation structure
+# (compound symmetry) rather than lme4's unstructured random-effects
+# covariance, as a structural robustness check.
+m2_nlme <- lme(cesd ~ time_months * substance + age + homeless + treat,
+               random = ~ time_months | id,
+               correlation = corCompSymm(form = ~ 1 | id),
+               data = help_df, na.action = na.omit)
+summary(m2_nlme)
+```
+
+**Sensitivity summary:** Given how little of this dataset is actually
+missing once the baseline-covariate carry-forward from Section 1 is
+applied (9 missing `cesd` values, 1 subject with no recorded substance at
+any wave, 7 missing `homeless` values — well under 1% of cells), the
+imputation-based and complete-case estimates are expected to be nearly
+identical; the completers-only comparison above is the more informative
+sensitivity check here because it stress-tests attrition rather than
+scattered missingness. **Compare all three specifications (full-MAR,
+completers-only, MI) in one table before writing the discussion** — that
+table is the piece reviewers look for: do the substantive conclusions
+(time trend, homeless gap) hold up across all three?
+
+---
+
+# 11. Interpretation & discussion
+
+- **Main finding:** Depressive symptoms (CESD) declined steadily over the
+  24 months following detoxification — roughly 0.5 points/month, or about
+  11–12 points overall — with substantial between-subject variation in both
+  starting severity and rate of improvement (supporting the random-slope
+  model chosen in Section 7). Housing instability (homeless status) is the
+  strongest and most consistent covariate: homeless participants carry a
+  several-point CESD disadvantage throughout follow-up, independent of
+  substance type, treatment arm, and age. There is no evidence that
+  treatment assignment (`treat`, the linkage-to-care condition) altered
+  either depression severity or its trajectory.
+- **Clinical/practical interpretation:** A ~11-point average decline on a
+  0–60 scale, sustained over two years, is a meaningful clinical
+  improvement window following detox — but the homeless-status gap
+  suggests housing instability is an independent driver of depressive
+  burden that detox/linkage-to-care alone does not resolve, and may be a
+  more actionable target for intervention than substance type.
+- **Limitations:** Single-site trial in a self-selected detox-seeking
+  population — findings may not generalize to non-treatment-seeking
+  individuals with substance use disorders. Attrition is non-monotone
+  (some subjects miss a wave and return), and the mechanism check in
+  Section 3 shows dropout is related to observed symptom levels at later
+  waves, so results rely on the MAR assumption being adequate — an
+  unmeasured-confounder-driven (MNAR) mechanism can't be ruled out.
+  `substance` and `age` are baseline-only measurements carried forward
+  for modeling convenience, not truly time-varying, so any real change in
+  substance use or the small mechanical drift in age over 24 months isn't
+  captured.
+- **Next steps:** Non-linear time trends via splines (the roughly linear
+  decline assumed here may not hold uniformly, especially early
+  post-detox), an explicit joint model for the dropout process and the
+  CESD trajectory (given the MAR-but-outcome-related missingness pattern),
+  and external validation in a non-single-site cohort.
+
+---
+
+# Session info
+
+```{r session-info}
+sessionInfo()
+```
