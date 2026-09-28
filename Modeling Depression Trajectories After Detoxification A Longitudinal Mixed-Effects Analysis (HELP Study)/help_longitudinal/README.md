@@ -11,7 +11,6 @@ How does depressive symptom severity (CESD) change over 24 months following deto
 ```
 .
 ├── analysis.Rmd                              # Main analysis: data cleaning, EDA, modeling, diagnostics
-├── analysis.html                             # Knitted output of analysis.Rmd
 ├── R/
 │   └── helpers.R                             # Helper functions sourced by analysis.Rmd
 │                                              #   (missingness_by_wave, plot_trajectories,
@@ -20,20 +19,33 @@ How does depressive symptom severity (CESD) change over 24 months following deto
 │   └── HELPfull.csv                          # Source dataset (mosaicData::HELPfull)
 ├── figs/                                     # Figures generated on knit (fig.path in analysis.Rmd)
 ├── output/
-│   └── analysis.html                         # Earlier/alternate knit output
+│   └── analysis.html                         # THE knitted output -- canonical, always regenerated on Knit
 └── Depression_Trajectories_HELP_Study.docx   # Standalone written report (first-person, with figures)
 ```
 
 ## How to run
 
-1. Open `analysis.Rmd` in RStudio (Run All, or Knit).
-2. The setup chunk installs any missing packages automatically:
+1. Open `analysis.Rmd` in RStudio and Knit (Ctrl+Shift+K), or Run All chunks.
+2. The `.Rmd`'s YAML `knit:` field points the "Knit" button at
+   `rmarkdown::render(..., output_dir = "output")`, so the rendered HTML
+   always lands at `output/analysis.html` rather than next to the `.Rmd` --
+   there is now a single canonical rendered copy instead of two that can
+   drift out of sync. If you render from the console instead (e.g.
+   `rmarkdown::render("analysis.Rmd")` with no `output_dir` argument), that
+   call bypasses the YAML `knit:` field and writes `analysis.html` back into
+   the project root, so prefer the Knit button or pass
+   `output_dir = "output"` explicitly.
+3. The setup chunk installs any missing packages automatically:
    `mosaicData`, `tidyverse`, `naniar`, `lme4`, `lmerTest`, `nlme`, `broom.mixed`,
-   `performance`, `DHARMa`, `mice`, `ggeffects`, `influence.ME`, `see`.
-3. `R/helpers.R` must sit alongside `analysis.Rmd` in an `R/` subfolder — it's sourced automatically in the setup chunk and supplies the plotting/summary helper functions the document calls.
-4. Optional: set `HELP_RUN_INFLUENCE=true` as an environment variable before knitting to also run the (slower) leave-one-subject-out influence diagnostics in Section 8.
+   `performance`, `DHARMa`, `mice`, `ggeffects`, `influence.ME`, `see`,
+   `RLRsim`, `gtsummary`, `boot`.
+4. `R/helpers.R` must sit alongside `analysis.Rmd` in an `R/` subfolder — it's sourced automatically in the setup chunk and supplies the plotting/summary helper functions the document calls.
+5. Optional (slow diagnostics, off by default): set `HELP_RUN_INFLUENCE=true`
+   before knitting to run the leave-one-subject-out influence diagnostics in
+   Section 8, and/or `HELP_RUN_BOOT=true` to run the 200-refit parametric
+   bootstrap CIs in Section 11.6.
 
-Both knitting and running chunks interactively (Ctrl+Enter / Run All) are supported.
+Both knitting and running chunks interactively (Ctrl+Enter / Run All) are supported. Figures still land in the top-level `figs/` folder regardless of where the HTML is rendered — that's fine, since the HTML embeds them (`self_contained` is `html_document`'s default), so `output/analysis.html` has no external dependency on `figs/`.
 
 ## Data
 
@@ -49,6 +61,14 @@ Both knitting and running chunks interactively (Ctrl+Enter / Run All) are suppor
 2. Random-intercept model (`m1`), adjusting for time, substance, age, homeless, treat.
 3. Random-slope model (`m2`) — the primary model — allowing each subject's own rate of change, supported by a likelihood-ratio test against `m1` and the individual trajectory plots.
 4. Diagnostics (`performance::check_model`, DHARMa) and three sensitivity checks: completers-only, multiple imputation, and an `nlme` cross-check with compound-symmetry correlation.
+5. Extended analyses (Section 11): marginal/conditional R², a full
+   AIC/BIC model comparison table, a time×homeless interaction (does
+   housing status change the *rate* of improvement, not just the level?),
+   standardized effect sizes, an exact `RLRsim` test for the random slope,
+   parametric bootstrap CIs, observed-vs-predicted plots for a sample of
+   subjects, an AR(1) correlation-structure cross-check, a baseline
+   "Table 1" by treatment arm, and a quadratic-time robustness check on
+   the linearity assumption.
 
 ## Key results
 
@@ -61,8 +81,12 @@ Both knitting and running chunks interactively (Ctrl+Enter / Run All) are suppor
 | Treatment arm | Not significant | p = .57 |
 | Age | Not significant | p = .78 |
 
-Full write-up, figures, and discussion: see `Depression_Trajectories_HELP_Study.docx` or the knitted `analysis.html`.
+Full write-up, figures, and discussion: see `Depression_Trajectories_HELP_Study.docx` or the knitted `output/analysis.html`.
 
 ## Known issues
 
 - `vis_miss()`'s rotated column labels in the missingness plot (Section 3 of `analysis.Rmd`) are slightly clipped by the plot's own panel/clip region — cosmetic only; the exact percentages are given in the table immediately below it.
+- A stale `analysis.html` may still exist in the project root from before the
+  `knit:` YAML field was added (it used to be written there by default). It's
+  no longer regenerated and safe to delete — `output/analysis.html` is now
+  the one canonical rendered copy.

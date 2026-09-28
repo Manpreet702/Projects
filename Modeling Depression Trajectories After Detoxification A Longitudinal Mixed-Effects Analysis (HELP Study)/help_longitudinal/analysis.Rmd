@@ -9,6 +9,15 @@ output:
     toc_float: true
     number_sections: true
     theme: flatly
+# Forces the RStudio "Knit" button (and knitr::knit/rmarkdown::render run
+# without an explicit output_dir) to write the rendered HTML into output/
+# instead of next to this .Rmd. Without this, "Knit" writes analysis.html
+# into the project root, which then drifts out of sync with output/analysis.html
+# -- this makes output/analysis.html the one canonical rendered copy.
+# NOTE: the "knit:" value below must stay on a single line -- YAML front
+# matter does not support an unquoted multi-line flow scalar, which is what
+# broke the earlier version of this field.
+knit: (function(input, ...) { rmarkdown::render(input, output_dir = file.path(dirname(input), "output"), envir = new.env(parent = globalenv())) })
 ---
 
 ```{r setup, include=FALSE}
@@ -18,7 +27,8 @@ knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
 # ---- Packages ----
 required_pkgs <- c("mosaicData", "tidyverse", "naniar", "lme4", "lmerTest",
                     "nlme", "broom.mixed", "performance", "DHARMa",
-                    "mice", "ggeffects", "influence.ME", "see")
+                    "mice", "ggeffects", "influence.ME", "see",
+                    "RLRsim", "gtsummary", "boot")
 new_pkgs <- required_pkgs[!(required_pkgs %in% installed.packages()[, "Package"])]
 if (length(new_pkgs)) {
   install.packages(new_pkgs, repos = "https://cloud.r-project.org")
@@ -36,6 +46,9 @@ library(DHARMa)
 library(mice)
 library(ggeffects)
 library(influence.ME)
+library(RLRsim)      # exact finite-sample test for a single variance component
+library(gtsummary)   # baseline "Table 1"
+library(boot)         # backs lme4::confint(..., method = "boot")
 
 analysis_dir <- tryCatch({
   ci <- knitr::current_input()
@@ -490,7 +503,321 @@ table is the piece reviewers look for: do the substantive conclusions
 
 ---
 
-# 11. Interpretation & discussion
+# 11. Extended / additional analyses
+
+The core question (Sections 1–10) is fully answered above. The chunks
+below are supplementary — each one is a small, self-contained addition
+that either (a) strengthens a claim already made, or (b) asks a natural
+follow-up question the main analysis didn't cover. None of them changes
+`m2`'s status as the primary model; they sit alongside it as extra
+evidence and robustness checks.
+
+## 11.1 Variance explained (marginal & conditional R²)
+
+```{r r2-nakagawa}
+performance::r2_nakagawa(m2)
+```
+
+*Marginal R²* is the variance explained by the fixed effects alone
+(time, substance, age, homeless, treat); *conditional R²* adds in the
+variance explained once the random subject-level intercepts and slopes
+are included. The gap between the two is a second, model-based way of
+seeing what the ICC in Section 5 already hinted at: a meaningful share
+of the explanatory power comes from stable between-subject differences,
+not just the measured covariates.
+
+## 11.2 Model comparison table (AIC/BIC across all fitted models)
+
+```{r model-comparison-table}
+model_comparison <- tibble::tibble(
+  model = c("m0: empty / unconditional means",
+            "m1: random intercept only",
+            "m2: random intercept + slope (primary)",
+            "m2_nlme: random intercept + slope, compound symmetry (nlme)"),
+  AIC = c(AIC(m0), AIC(m1), AIC(m2), AIC(m2_nlme)),
+  BIC = c(BIC(m0), BIC(m1), BIC(m2), BIC(m2_nlme))
+)
+model_comparison %>% arrange(AIC)
+```
+
+`m0` has a different (much smaller) fixed-effects specification, so its
+AIC/BIC aren't on a like-for-like footing with `m1`/`m2` — it's included
+just as a floor for reference. `m1` vs. `m2` is the comparison that
+matters (already tested formally with a likelihood-ratio test in Section
+7); `m2` vs. `m2_nlme` should land close together since they're
+essentially the same mean structure with a different random-effects/error
+covariance, which is itself a useful sanity check.
+
+## 11.3 Does housing status change the *rate* of improvement, not just the level?
+
+Section 9 treats `homeless` as a level shift (a constant CESD gap at
+every time point). It's a natural next question whether homelessness
+also changes the *slope* — i.e. whether housing-unstable participants
+improve at a different rate over the 24 months.
+
+```{r time-homeless-interaction}
+m3 <- lmer(cesd ~ time_months * substance + time_months * homeless +
+             age + treat + (1 + time_months | id), data = help_df)
+summary(m3)
+# m2 and m3 differ in FIXED effects (not just random effects, unlike the
+# m1-vs-m2 comparison in Section 7), so anova()/compare_models() will
+# automatically refit both models with ML instead of REML and print a
+# message saying so -- that's expected and required for this LRT to be valid.
+compare_models(m2, m3)
+```
+
+**How to read this:** if `time_months:homeless` is not significant and
+`compare_models()` doesn't favor `m3` over `m2` on AIC/BIC, that supports
+the simpler story already told in Section 9 — homelessness shifts the
+*level* of depressive symptoms but not the *trajectory* of recovery. If
+it *is* significant, that's a materially different and more actionable
+finding (e.g. homeless participants improving more slowly, not just
+starting higher) and would belong in the main Interpretation section.
+
+## 11.4 Effect sizes in standard-deviation units
+
+```{r effect-sizes-sd}
+sd_cesd <- sd(help_df$cesd, na.rm = TRUE)
+
+broom.mixed::tidy(m2, effects = "fixed", conf.int = TRUE) %>%
+  mutate(effect_size_sd = estimate / sd_cesd,
+         ci_low_sd = conf.low / sd_cesd,
+         ci_high_sd = conf.high / sd_cesd) %>%
+  select(term, estimate, effect_size_sd, ci_low_sd, ci_high_sd)
+```
+
+Raw CESD points are already interpretable on their own (it's a familiar
+0–60 clinical scale), but a standardized (Cohen's-*d*-like) version makes
+it easier to compare the *relative* size of, say, the homeless effect
+against the time effect, and is the number a meta-analysis or a reviewer
+from outside the substance-use-treatment field will look for first.
+
+## 11.5 Exact test for the random slope (RLRsim)
+
+The likelihood-ratio test in Section 7 (`compare_models(m1, m2)`) is a
+standard $\chi^2$ test, but it's known to be conservative here: under the
+null hypothesis the slope variance sits *on the boundary* of the
+parameter space (variance = 0 isn't in the interior), so the usual
+$\chi^2$ reference distribution isn't exactly right. `RLRsim::exactRLRT()`
+simulates the correct finite-sample null distribution for a single
+variance component and gives an exact p-value instead of an approximate
+one — the textbook-correct way to confirm the random slope is genuinely
+warranted rather than an artifact of a lenient test.
+
+```{r exact-rlrt}
+# exactRLRT needs the random intercept and random slope specified as two
+# SEPARATE (uncorrelated) random-effect terms, and needs ML (not REML) fits.
+# This is a slightly different parameterization from m1/m2 above (which
+# allow intercept-slope correlation), so we rebuild the three nested pieces
+# it requires: the null (intercept only), the alternative (intercept +
+# uncorrelated slope), and a slope-only model used to derive the null
+# distribution. Wrapped in tryCatch since exact simulation can occasionally
+# fail to converge with this many fixed-effect terms; falls back gracefully.
+rlrt_result <- tryCatch({
+  m0_int_ml    <- lmer(cesd ~ time_months * substance + age + homeless + treat +
+                          (1 | id), data = help_df, REML = FALSE)
+  mA_uncorr_ml <- lmer(cesd ~ time_months * substance + age + homeless + treat +
+                          (1 | id) + (0 + time_months | id), data = help_df, REML = FALSE)
+  m_slope_only <- lmer(cesd ~ time_months * substance + age + homeless + treat +
+                          (0 + time_months | id), data = help_df, REML = FALSE)
+  RLRsim::exactRLRT(m_slope_only, mA_uncorr_ml, m0_int_ml)
+}, error = function(e) {
+  message("exactRLRT did not complete (", conditionMessage(e), "); ",
+          "relying on the standard LRT in Section 7 instead, which is ",
+          "conservative but points the same direction.")
+  NULL
+})
+rlrt_result
+```
+
+## 11.6 Bootstrap confidence intervals (alternative to the Wald CIs)
+
+Wald-type CIs (used in Sections 6 and 9 via `confint(..., method = "Wald")`
+and `broom.mixed::tidy()`) assume a symmetric, normal sampling
+distribution, which can be a poor approximation for variance components
+and is occasionally shaky for fixed effects too when the random-effects
+structure is complex. A parametric bootstrap re-simulates from the fitted
+model many times and re-estimates each time, giving CIs that don't rely
+on that normality assumption. This is refit-heavy, so it's opt-in like
+the influence diagnostics in Section 8.
+
+```{r bootstrap-ci}
+if (identical(Sys.getenv("HELP_RUN_BOOT"), "true")) {
+  set.seed(123)
+  boot_ci <- confint(m2, method = "boot", nsim = 200, .progress = "none")
+  boot_ci
+} else {
+  cat("Bootstrap CIs skipped; set HELP_RUN_BOOT=true to run them ",
+      "(200 refits of m2 -- can take a few minutes).\n", sep = "")
+}
+```
+
+*If run:* compare these intervals side-by-side with the Wald CIs from
+Section 9 — for the fixed effects they should be very close (large *n*),
+but the random-effect variance/covariance CIs are the ones most likely to
+differ, and are the ones the Wald approximation is weakest for.
+
+## 11.7 Observed vs. model-predicted trajectories for individual subjects
+
+`check_model()` and DHARMa (Section 8) diagnose the model in aggregate.
+This is the complementary, more intuitive view: does the fitted model
+actually track individual people's ups and downs, or just the population
+average?
+
+```{r predicted-vs-observed, fig.width=9, fig.height=6}
+set.seed(42)
+sample_ids <- help_df %>%
+  filter(!is.na(substance)) %>%
+  distinct(id) %>%
+  slice_sample(n = 9) %>%
+  pull(id)
+
+plot_df <- help_df %>%
+  filter(id %in% sample_ids) %>%
+  mutate(pred = predict(m2, newdata = ., allow.new.levels = TRUE))
+
+ggplot(plot_df, aes(x = time_months)) +
+  geom_point(aes(y = cesd), na.rm = TRUE) +
+  geom_line(aes(y = pred), color = "steelblue", linewidth = 1) +
+  facet_wrap(~ id) +
+  labs(title = "Observed (points) vs. model-predicted (line) CESD",
+       subtitle = "9 randomly sampled subjects -- predictions use each subject's own BLUP intercept/slope",
+       x = "Months since baseline", y = "CESD")
+```
+
+*What to look for:* the blue line should visibly bend toward each
+subject's own points rather than just tracing a single population slope
+repeated nine times — that's the random-slope model doing its job. A
+subject where the line badly misses a big swing is worth a second look
+(cross-reference against the influence diagnostics in Section 8).
+
+## 11.8 AR(1) as a second alternative correlation structure
+
+Section 10 already cross-checks `m2` against an `nlme` fit with a
+compound-symmetry correlation structure (constant correlation between any
+two waves for the same subject). Compound symmetry is a strong
+assumption; an autoregressive structure — where correlation decays with
+the *gap* between waves rather than staying constant — is an equally
+natural alternative to test. The HELP waves are *nominally* equally
+spaced (0/6/12/18/24 months), but because some subjects miss a wave and
+return, the realized gaps between a given subject's consecutive
+*observed* rows aren't always 6 months. That rules out the standard
+discrete-lag `corAR1` (which assumes unit-spaced observations) in favor
+of `corCAR1`, its continuous-time analogue, which uses the actual
+`time_months` gap to compute the decay.
+
+```{r ar1-sensitivity}
+# corCAR1's default optimizer (nlminb) can fail to converge on this many
+# fixed-effect terms within its default 10-iteration cap. We give it a
+# reasonable starting value for the decay parameter, raise the iteration
+# limits, and switch to the "optim" optimizer, which is more robust here
+# than nlminb; if it still fails, we fall back to reporting the
+# compound-symmetry model from Section 10 rather than halting the knit.
+m2_nlme_car1 <- tryCatch({
+  lme(cesd ~ time_months * substance + age + homeless + treat,
+      random = ~ time_months | id,
+      correlation = corCAR1(value = 0.3, form = ~ time_months | id),
+      data = help_df, na.action = na.omit,
+      control = lmeControl(maxIter = 200, msMaxIter = 200, niterEM = 100,
+                            opt = "optim"))
+}, error = function(e) {
+  message("corCAR1 model did not converge (", conditionMessage(e), "); ",
+          "falling back to the compound-symmetry model (m2_nlme, Section 10) ",
+          "as the primary nlme cross-check -- the substantive conclusion ",
+          "(fixed effects are stable across correlation-structure choices) ",
+          "still holds without this extra structure.")
+  NULL
+})
+
+if (!is.null(m2_nlme_car1)) {
+  # NOTE: only the LAST top-level statement inside an if-block auto-prints in
+  # R, so AIC() here needs an explicit print() -- without it, the comparison
+  # is computed but silently discarded and only the tidy() table below shows.
+  print(AIC(m2_nlme, m2_nlme_car1))
+  broom.mixed::tidy(m2_nlme_car1, effects = "fixed", conf.int = TRUE)
+} else {
+  cat("Continuous-time AR(1) cross-check skipped: see the convergence message",
+      "above. The compound-symmetry cross-check in Section 10 already covers",
+      "the same robustness question.\n")
+}
+```
+
+If AIC prefers continuous-time AR(1) over compound symmetry that's
+informative about the *within-subject* correlation decay pattern, but —
+as in Section 10 — the substantive fixed-effect estimates (time trend,
+homeless gap) are the things that matter for the conclusions, and should
+be stable across all three specifications (`m2`, compound-symmetry
+`m2_nlme`, continuous-AR(1) `m2_nlme_car1`).
+
+## 11.9 Baseline characteristics ("Table 1")
+
+A table of baseline characteristics by treatment arm is standard in
+clinical/epidemiological write-ups and is missing here — worth adding
+mainly because a reader will look for it before trusting that `treat` is
+comparing like with like.
+
+```{r table1}
+baseline_df <- help_df %>% filter(time_months == 0)
+
+gtsummary::tbl_summary(
+  baseline_df %>% select(cesd, substance, homeless, age, treat),
+  by = treat,
+  statistic = list(gtsummary::all_continuous() ~ "{mean} ({sd})",
+                    gtsummary::all_categorical() ~ "{n} ({p}%)"),
+  missing = "no"
+) %>%
+  gtsummary::add_p() %>%
+  gtsummary::modify_caption("**Table 1. Baseline characteristics by treatment arm**")
+```
+
+If nothing here is significant (expected, since `treat` was presumably
+randomized), that's itself worth a one-line note — it rules out baseline
+imbalance as an alternative explanation for the "no treatment effect"
+finding in Section 9, rather than leaving that as an assumption.
+
+## 11.10 Is the linear time trend the right functional form?
+
+The whole analysis assumes CESD declines *linearly* in `time_months`.
+Section 12's "Next steps" note flags this as a real possibility worth
+checking, not just a caveat — a quadratic term is the cheapest way to
+test it empirically rather than leaving it to speculation.
+
+```{r quadratic-time}
+m2_quad <- lmer(cesd ~ (time_months + I(time_months^2)) * substance +
+                   age + homeless + treat + (1 + time_months | id),
+                 data = help_df)
+
+print(AIC(m2, m2_quad))
+print(anova(m2, m2_quad))   # lme4 automatically refits both by ML for this
+                            # fixed-effects comparison and reports it in the output
+
+# The AIC/LRT above say WHETHER curvature is supported, not its direction.
+# Report the quadratic coefficient itself so a reader can tell whether the
+# decline is accelerating or leveling off, rather than leaving that unstated.
+broom.mixed::tidy(m2_quad, effects = "fixed", conf.int = TRUE) %>%
+  filter(str_detect(term, "I\\(time_months"))
+```
+
+**How to read this:** if `m2_quad` isn't meaningfully preferred by
+AIC/BIC and the LRT is non-significant, that supports keeping the linear
+model (`m2`) as the primary, more interpretable specification. If the
+quadratic term *is* supported, that's evidence the rate of improvement
+itself changes over the 24 months (e.g. faster early, then leveling off)
+— a finding worth a sentence in the discussion and a candidate for the
+predicted-trajectory plot in Section 9 to visualize with `ggeffects`.
+
+---
+
+# 12. Interpretation & discussion
+
+*Note:* the bullets below restate the conclusions from the primary model
+(`m2`, Sections 6–9). Section 11 adds effect sizes, an exact variance-
+component test, bootstrap CIs, a baseline balance table, and two
+functional-form/covariance robustness checks — read those results
+alongside this section before finalizing language for a write-up, since
+a few bullets below (the linear time trend, the "level not slope" framing
+of the homeless effect) are exactly what Sections 11.3 and 11.10 test
+directly rather than assume.
 
 - **Main finding:** Depressive symptoms (CESD) declined steadily over the
   24 months following detoxification — roughly 0.5 points/month, or about
