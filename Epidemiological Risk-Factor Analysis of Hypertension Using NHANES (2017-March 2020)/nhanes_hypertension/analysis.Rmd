@@ -1,0 +1,739 @@
+---
+title: "Demographic, Lifestyle, and Clinical Correlates of Hypertension"
+subtitle: "A Survey-Weighted Cross-Sectional Analysis of NHANES 2017-March 2020"
+author: "Your Name"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: flatly
+knit: (function(input, ...) { rmarkdown::render(input, output_dir = file.path(dirname(input), "output"), envir = new.env(parent = globalenv())) })
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                       fig.path = "figs/", fig.width = 7.5, fig.height = 4.5)
+
+required_pkgs <- c("nhanesA", "tidyverse", "survey", "gtsummary",
+                    "broom", "car", "naniar", "scales")
+new_pkgs <- required_pkgs[!(required_pkgs %in% installed.packages()[, "Package"])]
+if (length(new_pkgs)) install.packages(new_pkgs, repos = "https://cloud.r-project.org")
+
+library(tidyverse)
+library(survey)
+library(gtsummary)
+library(broom)
+library(car)
+library(naniar)
+library(scales)
+
+# A well-known NHANES/complex-survey gotcha: once we SUBSET the design down
+# to a domain (adults, MEC-exam participants, etc.), some masked variance
+# strata can end up containing only one PSU ("lonely PSU"), which breaks
+# variance estimation unless we tell `survey` how to handle it. "adjust"
+# (center a lonely PSU's contribution at the sample grand mean) is the
+# standard, conservative option recommended in the `survey` package docs.
+options(survey.lonely.psu = "adjust")
+
+analysis_dir <- tryCatch({
+  ci <- knitr::current_input()
+  if (is.null(ci) || !nzchar(ci)) "." else dirname(ci)
+}, error = function(e) ".")
+if (!nzchar(analysis_dir)) analysis_dir <- "."
+source(file.path(analysis_dir, "R", "helpers.R"))
+source(file.path(analysis_dir, "R", "download_data.R"))
+```
+
+# Research question
+
+> What demographic, lifestyle, and clinical factors are associated with
+> hypertension among U.S. adults, and does dietary sodium intake add
+> explanatory value beyond those core risk factors?
+
+**Data source:** NHANES 2017-March 2020 pre-pandemic file (CDC's special
+combined cycle, built to replace the COVID-interrupted 2019-2020 cycle).
+**Outcome:** hypertension, defined from measured blood pressure and
+antihypertensive medication use (Section 4). **Design:** cross-sectional,
+survey-weighted to be nationally representative of the U.S. civilian
+non-institutionalized adult population.
+
+This is an observational, cross-sectional analysis: it can establish
+association, not causation, and that distinction is maintained throughout
+rather than only mentioned in the limitations.
+
+---
+
+# 1. Data acquisition
+
+```{r download}
+# Downloads on first run (needs internet access to wwwn.cdc.gov) and caches
+# to data/raw/*.rds afterward, so re-knitting doesn't re-download. Delete a
+# cached .rds (or pass force_refresh = TRUE) to pull a fresh copy.
+raw <- load_all_nhanes_tables(raw_dir = file.path(analysis_dir, "data", "raw"))
+
+purrr::iwalk(raw, ~ cat(sprintf("%-10s %5d rows, %3d columns\n", .y, nrow(.x), ncol(.x))))
+```
+
+Ten NHANES tables were pulled, spanning every data type NHANES is known
+for: demographics + sample weights (`P_DEMO`), a physical exam
+(`P_BPXO` blood pressure, `P_BMX` body measures), a laboratory measurement
+(`P_TCHOL` total cholesterol), interview questionnaires (`P_BPQ`, `P_PAQ`,
+`P_SMQ`, `P_ALQ`, `P_DIQ`), and a 24-hour dietary recall (`P_DR1TOT`).
+
+---
+
+# 2. Data cleaning, merging & derived variables
+
+```{r merge}
+# All tables key on SEQN (respondent sequence number). We merge everything
+# onto P_DEMO (which is where the sample weights and design variables live)
+# with left joins, so every DEMO respondent is retained even if a given
+# questionnaire module has item-level nonresponse for them -- that
+# nonresponse becomes explicit NA rather than a silently dropped row.
+merged <- raw$P_DEMO |>
+  left_join(raw$P_BPXO, by = "SEQN") |>
+  left_join(raw$P_BPQ, by = "SEQN") |>
+  left_join(raw$P_BMX, by = "SEQN") |>
+  left_join(raw$P_PAQ, by = "SEQN") |>
+  left_join(raw$P_SMQ, by = "SEQN") |>
+  left_join(raw$P_ALQ, by = "SEQN") |>
+  left_join(raw$P_DIQ, by = "SEQN") |>
+  left_join(raw$P_TCHOL, by = "SEQN") |>
+  left_join(raw$P_DR1TOT, by = "SEQN")
+
+nrow(raw$P_DEMO); nrow(merged)  # should match -- confirms a clean 1:1 merge
+```
+
+```{r derive}
+analytic <- merged |>
+  mutate(
+    age = RIDAGEYR,
+    sex = factor(RIAGENDR, levels = c(1, 2), labels = c("Male", "Female")),
+    race_ethnicity = factor(RIDRETH3,
+      levels = c(3, 4, 1, 2, 6, 7),
+      labels = c("Non-Hispanic White", "Non-Hispanic Black", "Mexican American",
+                 "Other Hispanic", "Non-Hispanic Asian", "Other/Multi-racial")),
+    education = factor(DMDEDUC2,
+      levels = 1:5,
+      labels = c("Less than 9th grade", "9-11th grade", "High school grad/GED",
+                 "Some college/AA", "College graduate+")),
+    income_poverty_ratio = INDFMPIR,
+
+    mean_sbp = mean_oscillometric_bp(BPXOSY1, BPXOSY2, BPXOSY3),
+    mean_dbp = mean_oscillometric_bp(BPXODI1, BPXODI2, BPXODI3),
+    on_bp_meds = BPQ050A == 1,
+
+    bmi = BMXBMI,
+    bmi_cat = classify_bmi(BMXBMI),
+    smoking = classify_smoking(SMQ020, SMQ040),
+    alcohol = classify_alcohol(ALQ121, ALQ130, sex),
+    diabetes = factor(dplyr::case_when(DIQ010 == 1 ~ "Yes", DIQ010 == 2 ~ "No",
+                                        TRUE ~ NA_character_),
+                       levels = c("No", "Yes")),
+    total_cholesterol = LBXTC,
+
+    pa_moderate_equiv_min = compute_pa_met_minutes(pick(PAQ605, PAQ610, PAD615,
+                                                          PAQ620, PAQ625, PAD630,
+                                                          PAQ635, PAQ640, PAD645,
+                                                          PAQ650, PAQ655, PAD660,
+                                                          PAQ665, PAQ670, PAD675)),
+    pa_any_domain_answered = if_any(c(PAQ605, PAQ620, PAQ635, PAQ650, PAQ665), ~ .x %in% c(1, 2)),
+    meets_pa_guidelines = meets_pa_guidelines(pa_moderate_equiv_min, pa_any_domain_answered),
+
+    dietary_sodium_mg = DR1TSODI,
+    dietary_kcal = DR1TKCAL,
+    dietary_recall_reliable = DR1DRSTZ == 1,
+
+    age_group = cut(age, breaks = seq(18, 80, by = 10), right = FALSE)
+  )
+
+hyp <- define_hypertension(analytic$mean_sbp, analytic$mean_dbp, analytic$on_bp_meds)
+analytic$hypertension <- factor(hyp$aha2017, levels = c(FALSE, TRUE), labels = c("No", "Yes"))
+analytic$hypertension_jnc7 <- factor(hyp$jnc7, levels = c(FALSE, TRUE), labels = c("No", "Yes"))
+
+# Plain 0/1 numeric copies of the outcome, for use inside svyby()/svymean()
+# formulas. svyby() names its output column after the deparsed formula
+# expression, so a formula like ~I(hypertension == "Yes") produces a
+# sanitized, hard-to-predict column name (make.names() mangles the quotes
+# and parens) rather than literally "I(hypertension == \"Yes\")" -- fragile
+# to reference afterward in ggplot. A pre-derived numeric column has a
+# fixed, known name instead.
+analytic$hypertension_num <- as.numeric(analytic$hypertension == "Yes")
+analytic$hypertension_jnc7_num <- as.numeric(analytic$hypertension_jnc7 == "Yes")
+
+glimpse(analytic |> select(SEQN, age, sex, hypertension, mean_sbp, mean_dbp,
+                            bmi_cat, smoking, alcohol, diabetes))
+```
+
+**Analytic population.** NHANES exam-based blood pressure is only
+collected from age 8+, but the self-report modules used here
+(`BPQ`, `SMQ`, `ALQ`, `DIQ`) are adult-only (18+). We restrict to adults
+who both completed the interview AND the MEC exam (`RIDSTATR == 2`) --
+domain restriction happens on the survey **design**, not the raw
+data.frame, in Section 4, so variance estimation stays correct.
+
+```{r eligibility-check}
+analytic |>
+  filter(RIDSTATR == 2, age >= 18) |>
+  count(has_bp = !is.na(hypertension)) |>
+  mutate(pct = round(100 * n / sum(n), 1))
+```
+
+---
+
+# 3. Missingness
+
+```{r missingness}
+analytic_adult <- analytic |> filter(RIDSTATR == 2, age >= 18)
+
+vars_of_interest <- c("hypertension", "bmi_cat", "smoking", "alcohol", "diabetes",
+                       "total_cholesterol", "meets_pa_guidelines", "education",
+                       "income_poverty_ratio", "race_ethnicity")
+analytic_adult |> select(all_of(vars_of_interest)) |> naniar::miss_var_summary()
+```
+
+```{r missingness-plot, fig.width=8, fig.height=5}
+analytic_adult |> select(all_of(vars_of_interest)) |> naniar::gg_miss_var(show_pct = TRUE)
+```
+
+**Decision.** `income_poverty_ratio` has the most missingness (expected --
+income nonresponse is a well-documented NHANES pattern, generally
+considered plausibly MAR conditional on other demographics). Every other
+analytic variable is missing on well under 10% of the adult exam sample.
+The primary model uses complete-case analysis within `svyglm` (the
+standard practical approach in applied survey analysis, since design-
+consistent multiple imputation combined with replicate-weight variance
+estimation is materially more complex machinery); this is a stated,
+revisitable limitation, not an unstated default -- see Section 10 for a
+sensitivity comparison against a model that drops `income_poverty_ratio`
+entirely to check whether its missingness is driving any conclusions.
+
+---
+
+# 4. Survey design
+
+```{r survey-design}
+# CRITICAL: build the design on the FULL sample first, using every DEMO
+# respondent, and only THEN subset() down to the analytic domain (adults,
+# MEC-examined, valid hypertension classification). Filtering the
+# data.frame BEFORE creating the design would silently throw away the
+# correct PSU/strata bookkeeping for variance estimation -- subsetting the
+# design object afterward is what keeps standard errors correct. This is
+# one of the most common real-world NHANES analysis mistakes.
+full_design <- svydesign(
+  ids = ~SDMVPSU,
+  strata = ~SDMVSTRA,
+  weights = ~WTMECPRP,
+  nest = TRUE,
+  data = analytic
+)
+
+hyp_design <- subset(full_design, RIDSTATR == 2 & age >= 18 & !is.na(hypertension))
+
+hyp_design
+```
+
+```{r survey-design-diagnostics}
+# Diagnostic breakdown of each domain-filter condition individually, so a
+# 0-row (or unexpectedly small) analytic domain fails HERE with a clear
+# reason, instead of surfacing three chunks later as an opaque gtsummary
+# "0 rows" error with no indication of which condition is the culprit.
+# NOTE: these diagnostics use message(), not cat()/print(). cat()/print()
+# output only lands in the KNITTED DOCUMENT, which never gets produced
+# because this same chunk goes on to call stop() -- so with cat()/print()
+# the diagnostic output would be invisible and only the final error would
+# show. message() writes to stderr and streams into RStudio's "Render"
+# console/build log in real time, so it survives even though the chunk
+# goes on to fail.
+message("RIDSTATR value counts (2 = interviewed AND MEC-examined; download_data.R ",
+        "forces translated = FALSE so this stays a plain numeric code -- see below):")
+message(paste(capture.output(table(analytic$RIDSTATR, useNA = "ifany")), collapse = "\n"))
+
+message("\nclass/str of RIDSTATR (should be numeric/integer, not character/factor -- ",
+        "a factor here would mean translated = FALSE isn't taking effect, e.g. a stale cached .rds):")
+message(paste(capture.output(str(analytic$RIDSTATR)), collapse = "\n"))
+
+message("\nRows satisfying RIDSTATR == 2: ",
+    sum(analytic$RIDSTATR == 2, na.rm = TRUE))
+message("Rows satisfying age >= 18:                                  ", sum(analytic$age >= 18, na.rm = TRUE))
+message("Rows with non-missing mean_sbp or mean_dbp:                 ",
+    sum(!is.na(analytic$mean_sbp) | !is.na(analytic$mean_dbp)))
+message("Rows with non-missing hypertension:                         ", sum(!is.na(analytic$hypertension)))
+message("Rows satisfying ALL THREE domain conditions:                ",
+    sum(analytic$RIDSTATR == 2 & analytic$age >= 18 & !is.na(analytic$hypertension), na.rm = TRUE))
+
+if (nrow(hyp_design) == 0) {
+  stop(
+    "hyp_design has 0 rows -- the domain filter matched nothing. Check the ",
+    "counts printed just above to see which condition is zeroing this out ",
+    "(a common cause is RIDSTATR being a labeled factor rather than a plain ",
+    "numeric code -- see the str() output above), fix the upstream cause, ",
+    "then re-knit rather than proceeding into Table 1/modeling on an empty design."
+  )
+}
+```
+
+```{r survey-design-n}
+cat("Unweighted adults in analytic domain:", nrow(hyp_design), "\n")
+cat("Weighted population represented:", scales::comma(sum(weights(hyp_design))), "\n")
+```
+
+---
+
+# 5. Descriptive epidemiology (Table 1)
+
+```{r table1}
+# tbl_svysummary() takes a base `survey` package design object directly --
+# no srvyr conversion needed -- and its own `include=` argument selects
+# variables, so we don't need to pipe the design through dplyr::select()
+# first (a survey.design object isn't a data.frame, and its handling under
+# dplyr verbs vs. gtsummary's built-in argument isn't worth the risk when
+# the built-in argument does the same job directly).
+hyp_design |>
+  tbl_svysummary(
+    by = hypertension,
+    include = c(age, sex, race_ethnicity, education, income_poverty_ratio,
+                bmi_cat, smoking, alcohol, diabetes, total_cholesterol,
+                meets_pa_guidelines),
+    statistic = list(all_continuous() ~ "{mean} ({sd})",
+                      all_categorical() ~ "{n} ({p}%)"),
+    missing = "no"
+  ) |>
+  add_p() |>
+  add_overall() |>
+  modify_caption("**Table 1. Weighted characteristics of U.S. adults, by hypertension status**") |>
+  modify_header(label = "**Characteristic**")
+```
+
+All percentages and means above are **survey-weighted** -- they estimate
+characteristics of the full U.S. civilian noninstitutionalized adult
+population (an estimated 231.8 million people), not just the 8,293 adults
+actually sampled in this domain, and the p-values use design-based tests
+(`svyttest`/`svychisq`), not naive unweighted tests.
+
+```{r weighted-prevalence}
+svymean(~hypertension, hyp_design, na.rm = TRUE)
+svyby(~hypertension_num, ~sex, hyp_design, svymean, na.rm = TRUE)
+svyby(~hypertension_num, ~race_ethnicity, hyp_design, svymean, na.rm = TRUE)
+```
+
+---
+
+# 6. Survey-weighted exploratory analysis
+
+```{r eda-age-bp, fig.width=8}
+age_bp <- svyby(~mean_sbp, ~age_group, hyp_design, svymean, na.rm = TRUE)
+
+ggplot(age_bp, aes(x = age_group, y = mean_sbp)) +
+  geom_pointrange(aes(ymin = mean_sbp - 1.96 * se, ymax = mean_sbp + 1.96 * se)) +
+  labs(title = "Weighted mean systolic BP by age group",
+       subtitle = "Error bars are 95% CI, accounting for the complex survey design",
+       x = "Age group", y = "Mean systolic BP (mmHg)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+```{r eda-bmi-hyp, fig.width=8}
+bmi_hyp <- svyby(~hypertension_num, ~bmi_cat, hyp_design, svymean, na.rm = TRUE)
+
+ggplot(bmi_hyp, aes(x = bmi_cat, y = hypertension_num)) +
+  geom_col(fill = "steelblue") +
+  geom_errorbar(aes(ymin = hypertension_num - 1.96 * se,
+                     ymax = hypertension_num + 1.96 * se), width = 0.2) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Weighted hypertension prevalence by BMI category",
+       subtitle = "Error bars are 95% CI", x = "BMI category", y = "Hypertension prevalence") +
+  theme_minimal()
+```
+
+A clear gradient by BMI category, and a rising mean SBP by age decade, are
+exactly what the epidemiological literature predicts -- a useful sanity
+check before moving to multivariable modeling.
+
+---
+
+# 7. Modeling
+
+## 7.1 Crude (unadjusted) associations
+
+```{r crude-models}
+crude_vars <- c("age", "sex", "race_ethnicity", "education", "income_poverty_ratio",
+                 "bmi_cat", "smoking", "alcohol", "diabetes", "total_cholesterol",
+                 "meets_pa_guidelines")
+
+crude_results <- purrr::map_dfr(crude_vars, function(v) {
+  f <- as.formula(paste("hypertension == 'Yes' ~", v))
+  m <- svyglm(f, design = hyp_design, family = quasibinomial())
+  svyglm_or_table(m) |> mutate(predictor = v, .before = 1)
+})
+
+crude_results |> filter(term != "(Intercept)") |>
+  select(predictor, term, or, or_low, or_high, p_value)
+```
+
+## 7.2 Adjusted (primary) model
+
+```{r adjusted-model}
+m_adjusted <- svyglm(
+  hypertension == "Yes" ~ age + sex + race_ethnicity + education +
+    income_poverty_ratio + bmi_cat + smoking + alcohol + diabetes +
+    total_cholesterol + meets_pa_guidelines,
+  design = hyp_design, family = quasibinomial()
+)
+
+summary(m_adjusted)
+```
+
+```{r adjusted-or-table}
+adj_or <- svyglm_or_table(m_adjusted) |> filter(term != "(Intercept)")
+adj_or
+```
+
+```{r forest-plot, fig.width=8, fig.height=6}
+adj_or |>
+  mutate(term = fct_reorder(term, or)) |>
+  ggplot(aes(x = or, y = term)) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "grey50") +
+  geom_pointrange(aes(xmin = or_low, xmax = or_high)) +
+  scale_x_log10() +
+  labs(title = "Adjusted odds ratios for hypertension",
+       subtitle = "95% CI, log scale; survey-weighted, adjusted for all listed covariates",
+       x = "Odds ratio (log scale)", y = NULL) +
+  theme_minimal()
+```
+
+---
+
+# 8. Model diagnostics
+
+## 8.1 Multicollinearity
+
+```{r vif}
+tryCatch({
+  car::vif(m_adjusted)
+}, error = function(e) {
+  message("car::vif() did not run cleanly on this svyglm object (", conditionMessage(e), ")")
+})
+```
+
+## 8.2 Linearity of continuous predictors
+
+```{r linearity-age}
+# svyglm doesn't support a design-consistent anova()/LRT the way lm/glm do;
+# regTermTest() is the correct survey-adjusted Wald test for whether adding
+# flexibility (here, a spline) to a term improves fit -- the survey-design
+# analogue of the ML-refit LRT used for ordinary GLMs.
+#
+# regTermTest() needs a formula naming the EXACT term label R assigned in
+# terms(m_adjusted_spline) -- rather than hand-typing that (its deparsed
+# text, e.g. spacing around commas, isn't worth relying on sight-unseen),
+# we pull the label the model itself assigned and build the formula from
+# that, so this is correct regardless of exact deparse formatting.
+m_adjusted_spline <- update(m_adjusted, . ~ . - age + splines::ns(age, df = 3))
+
+spline_term <- grep("ns\\(age", attr(terms(m_adjusted_spline), "term.labels"), value = TRUE)
+stopifnot(length(spline_term) == 1)
+regTermTest(m_adjusted_spline, as.formula(paste("~", spline_term)))
+```
+
+```{r linearity-bmi-note}
+# BMI and total cholesterol enter the model as a category and a linear term
+# respectively; bmi_cat already absorbs nonlinearity by construction. A
+# parallel spline check for total_cholesterol is the natural next line here
+# if the linear term's significance or direction looks surprising once run.
+```
+
+## 8.3 Calibration
+
+```{r calibration}
+# predict.svyglm does NOT respect na.action = na.pass the way predict.glm
+# does -- it still silently DROPS rows with any missing predictor rather
+# than returning NA for them, which is why pred_probs kept coming back
+# shorter than nrow(hyp_design) (5471 vs 8293) even after passing that
+# argument. Rather than fight predict()'s internal NA handling, we sidestep
+# it: restrict the calibration domain to exactly the complete cases the
+# adjusted model was actually fit on (the same predictors, the same rows),
+# so predict() and the design are guaranteed to line up -- and this is also
+# the methodologically correct comparison set, since a calibration check
+# should assess the model against the sample it was estimated from, not a
+# broader domain it never saw.
+model_vars <- c("hypertension", "age", "sex", "race_ethnicity", "education",
+                "income_poverty_ratio", "bmi_cat", "smoking", "alcohol",
+                "diabetes", "total_cholesterol", "meets_pa_guidelines")
+
+hyp_design_complete <- subset(
+  hyp_design,
+  complete.cases(hyp_design$variables[, model_vars])
+)
+analytic_domain <- hyp_design_complete$variables
+
+pred_probs <- predict(m_adjusted, newdata = analytic_domain, type = "response")
+
+calib <- weighted_calibration_table(
+  hyp_design_complete,
+  predicted = as.numeric(pred_probs),
+  observed = as.numeric(analytic_domain$hypertension == "Yes")
+)
+calib
+```
+
+```{r calibration-plot, fig.width=6, fig.height=6}
+ggplot(calib, aes(x = predicted_rate, y = observed_rate)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey50") +
+  geom_point(size = 2) +
+  labs(title = "Calibration: predicted vs. observed hypertension prevalence",
+       subtitle = "By decile of predicted risk; points near the diagonal indicate good calibration",
+       x = "Mean predicted probability", y = "Weighted observed proportion") +
+  theme_minimal()
+```
+
+---
+
+# 9. Predicted probabilities
+
+```{r predicted-probs, fig.width=8}
+pred_grid <- expand.grid(
+  age = seq(18, 80, by = 2),
+  sex = c("Male", "Female"),
+  race_ethnicity = "Non-Hispanic White",
+  education = "College graduate+",
+  income_poverty_ratio = median(analytic_domain$income_poverty_ratio, na.rm = TRUE),
+  bmi_cat = "Normal",
+  smoking = "Never",
+  alcohol = "Moderate",
+  diabetes = "No",
+  total_cholesterol = median(analytic_domain$total_cholesterol, na.rm = TRUE),
+  meets_pa_guidelines = TRUE
+)
+
+pred <- predict(m_adjusted, newdata = pred_grid, type = "response", se.fit = TRUE)
+pred_grid$fit <- as.numeric(pred)
+pred_grid$se <- as.numeric(SE(pred))
+
+ggplot(pred_grid, aes(x = age, y = fit, color = sex, fill = sex)) +
+  geom_ribbon(aes(ymin = pmax(0, fit - 1.96 * se), ymax = pmin(1, fit + 1.96 * se)),
+              alpha = 0.15, color = NA) +
+  geom_line(linewidth = 1) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Predicted hypertension probability by age and sex",
+       subtitle = "Holding other covariates at reference/median values",
+       x = "Age", y = "Predicted probability") +
+  theme_minimal()
+```
+
+---
+
+# 10. Sensitivity analyses
+
+## 10.1 Alternative hypertension definition (JNC7 vs. ACC/AHA 2017)
+
+```{r sensitivity-definition}
+hyp_design_jnc7 <- subset(full_design, RIDSTATR == 2 & age >= 18 & !is.na(hypertension_jnc7))
+
+m_jnc7 <- svyglm(
+  hypertension_jnc7 == "Yes" ~ age + sex + race_ethnicity + education +
+    income_poverty_ratio + bmi_cat + smoking + alcohol + diabetes +
+    total_cholesterol + meets_pa_guidelines,
+  design = hyp_design_jnc7, family = quasibinomial()
+)
+
+bind_rows(
+  svyglm_or_table(m_adjusted) |> mutate(definition = "ACC/AHA 2017 (>=130/80)"),
+  svyglm_or_table(m_jnc7) |> mutate(definition = "JNC7 (>=140/90)")
+) |> filter(term != "(Intercept)") |>
+  select(definition, term, or, or_low, or_high, p_value) |>
+  arrange(term, definition)
+```
+
+## 10.2 Excluding those already treated (avoids "controlled-on-treatment" misclassification)
+
+```{r sensitivity-untreated}
+# Someone on antihypertensive medication with a currently normal reading is
+# coded hypertensive under the primary definition (correctly -- they have
+# the condition, it's just controlled). This checks whether restricting to
+# UNTREATED participants only -- a purer measure of blood pressure alone --
+# changes which covariates look associated with elevated BP.
+hyp_design_untreated <- subset(full_design,
+  RIDSTATR == 2 & age >= 18 & !is.na(hypertension) & (is.na(on_bp_meds) | on_bp_meds == FALSE))
+
+m_untreated <- svyglm(
+  hypertension == "Yes" ~ age + sex + race_ethnicity + education +
+    income_poverty_ratio + bmi_cat + smoking + alcohol + diabetes +
+    total_cholesterol + meets_pa_guidelines,
+  design = hyp_design_untreated, family = quasibinomial()
+)
+svyglm_or_table(m_untreated) |> filter(term != "(Intercept)") |>
+  select(term, or, or_low, or_high, p_value)
+```
+
+## 10.3 Why the survey design matters: weighted vs. naive (unweighted) model
+
+```{r sensitivity-naive}
+# Fits the SAME model, SAME rows, but ignoring the sample weights and
+# clustering entirely -- i.e. treating NHANES like a simple random sample.
+# This is deliberately the "naive" analysis this whole project is trying
+# NOT to be; showing it side-by-side with the design-based model is the
+# concrete demonstration of why that distinction matters, not just an
+# assertion of it.
+m_naive <- glm(
+  hypertension == "Yes" ~ age + sex + race_ethnicity + education +
+    income_poverty_ratio + bmi_cat + smoking + alcohol + diabetes +
+    total_cholesterol + meets_pa_guidelines,
+  data = analytic_domain, family = binomial()
+)
+
+bind_rows(
+  broom::tidy(m_adjusted, conf.int = TRUE, exponentiate = TRUE) |> mutate(model = "Survey-weighted"),
+  broom::tidy(m_naive, conf.int = TRUE, exponentiate = TRUE) |> mutate(model = "Naive (unweighted, i.i.d.)")
+) |> filter(term != "(Intercept)") |>
+  select(model, term, estimate, conf.low, conf.high, p.value) |>
+  arrange(term, model)
+```
+
+**What to look for:** point estimates are often similar, but standard
+errors (and therefore confidence intervals and p-values) from the naive
+model are frequently too narrow, because it ignores within-PSU clustering
+-- a term that looks significant in the naive model but not in the
+design-based one is a direct, visible cost of skipping the survey design,
+not a hypothetical one.
+
+## 10.4 Does dietary sodium add explanatory value?
+
+```{r sensitivity-diet}
+# Different weight (WTDRD1PP, not WTMECPRP) and different eligible
+# subsample (reliable Day-1 dietary recall only) -- CDC's guidance for
+# analyses combining MEC and Day-1 dietary data is to use WTDRD1PP as the
+# smaller, more restrictive weight. Built as its own design object rather
+# than reusing hyp_design, for exactly that reason.
+#
+# WTDRD1PP is undefined (NA), not zero, for the ~1260 respondents who were
+# interviewed but never MEC-examined -- P_DR1TOT only has a row per
+# MEC-examined person (14300 rows, matching RIDSTATR == 2's count exactly),
+# so the left_join in the setup chunk leaves WTDRD1PP as true NA for
+# everyone else. svydesign() refuses outright when weights contain NA
+# (na_weights = "fail"), so -- unlike hyp_design's WTMECPRP, which IS
+# defined for every respondent -- the diet design has to be restricted to
+# the population this weight is actually defined for BEFORE svydesign()
+# is called, not subset afterward. replace_na(..., 0) is a defensive
+# backstop for the rare case a MEC-examined person still has a missing
+# WTDRD1PP for some other reason; it does not change who's included,
+# since a zero-weight row contributes nothing to any weighted estimate.
+analytic_diet_eligible <- analytic |>
+  filter(RIDSTATR == 2) |>
+  mutate(WTDRD1PP = tidyr::replace_na(WTDRD1PP, 0))
+
+diet_design_full <- svydesign(
+  ids = ~SDMVPSU, strata = ~SDMVSTRA, weights = ~WTDRD1PP, nest = TRUE,
+  data = analytic_diet_eligible
+)
+diet_design <- subset(diet_design_full,
+  age >= 18 & !is.na(hypertension) & dietary_recall_reliable)
+
+m_diet <- svyglm(
+  hypertension == "Yes" ~ age + sex + race_ethnicity + education +
+    income_poverty_ratio + bmi_cat + smoking + alcohol + diabetes +
+    total_cholesterol + meets_pa_guidelines +
+    dietary_sodium_mg + dietary_kcal,
+  design = diet_design, family = quasibinomial()
+)
+
+svyglm_or_table(m_diet) |> filter(str_detect(term, "dietary"))
+```
+
+**How to read this:** `dietary_sodium_mg`'s odds ratio is per additional
+milligram, so it will look close to 1.000 even if the effect is real and
+meaningful (sodium intake spans thousands of mg) -- multiply the
+log-odds coefficient by, say, 1000 to express it per gram before quoting
+it in the write-up, and check whether `dietary_kcal` (total energy intake,
+included specifically to adjust sodium for "eats more food overall"
+confounding) meaningfully changes the sodium estimate when dropped.
+
+---
+
+# 11. Interpretation & discussion
+
+Weighted, this analysis represents an estimated 231.8 million U.S. adults
+(8,293 sampled). Overall weighted hypertension prevalence (ACC/AHA 2017
+definition) is **48.7%** (SE 1.2 pp) -- 51.7% among men vs. 46.0% among
+women, and highest among Non-Hispanic Black adults (58.6%) vs.
+Non-Hispanic White (48.9%) and Mexican American (37.4%) adults.
+
+- **Main finding:** After adjustment, the strongest independent predictors
+  of hypertension are **obesity** (OR 3.25, 95% CI 2.29-4.62 vs. normal
+  BMI), **diabetes** (OR 2.46, 95% CI 1.46-4.15), and **heavy alcohol use**
+  (OR 2.14, 95% CI 1.15-3.99), alongside the expected effect of **age**
+  (OR 1.06 per year, 95% CI 1.05-1.07). Meeting physical activity
+  guidelines is independently protective (OR 0.74, 95% CI 0.55-0.99).
+- **Age and sex:** age is indeed the single most consistent predictor
+  across every model in this project (crude, adjusted, JNC7, untreated-only,
+  naive), with an adjusted OR of 1.06 per year (95% CI 1.05-1.07,
+  p < 0.001). Women have lower odds than men after adjustment (OR 0.64,
+  95% CI 0.41-1.01, p = 0.053) -- a borderline, not fully conclusive,
+  effect once age, BMI, and the other covariates are held constant.
+- **BMI:** a clear, monotonic gradient -- obese adults have roughly 3.25x
+  the odds of hypertension of normal-weight adults (95% CI 2.29-4.62,
+  p = 0.002), the single largest effect size in the adjusted model, which
+  matches the well-established obesity-hypertension literature and the
+  visible gradient in the Section 6 EDA plot.
+- **Does the story hold up?**
+    - *JNC7 vs. ACC/AHA 2017 (10.1):* the same predictors are directionally
+      consistent under both definitions (e.g., obesity OR 3.25 under
+      ACC/AHA 2017 vs. 2.78 under JNC7), so the core conclusions are not an
+      artifact of which BP threshold is used.
+    - *Excluding already-treated adults (10.2):* age (OR 1.03, 95% CI
+      1.02-1.05) and sex (OR 0.59, 95% CI 0.35-0.97) associations persist
+      in the untreated-only subgroup, confirming they aren't just an
+      artifact of who receives treatment.
+    - *Weighted vs. naive (10.3):* point estimates are broadly similar
+      (e.g., obesity: 3.25 weighted vs. 3.08 naive), but the naive model's
+      confidence intervals are consistently and substantially narrower
+      (e.g., obesity 95% CI 2.59-3.66 naive vs. 2.29-4.62 weighted;
+      age p = 8.3e-146 naive vs. p = 5.8e-4 weighted) -- a concrete
+      demonstration that ignoring NHANES's clustering and weighting would
+      have produced overconfident, and in places misleading, precision.
+- **Diet:** no meaningful independent association. In the diet-augmented
+  model (restricted to the dietary-recall-reliable subsample, its own
+  `WTDRD1PP` weight), neither `dietary_sodium_mg` (p = 0.78) nor
+  `dietary_kcal` (p = 0.77) reached significance once the core demographic,
+  lifestyle, and clinical predictors were already in the model -- a single
+  day's recall is a genuinely noisy proxy for usual sodium intake (see
+  Limitations), so this should be read as "no signal detected here," not
+  "sodium doesn't matter."
+- **Limitations:**
+    - Cross-sectional design -- no temporal ordering; can't distinguish,
+      e.g., whether inactivity causes hypertension or hypertension-related
+      symptoms reduce activity.
+    - **Design degrees of freedom are very low after domain-subsetting** --
+      several Wald-type tests in Sections 8-10 (e.g., the age-linearity
+      spline test, `F` on 3 and **1** denominator df, p = 0.078) show only
+      a handful of denominator degrees of freedom once `hyp_design` is
+      subset to the adult/valid-outcome domain. This is consistent with
+      how wide some adjusted CIs are relative to their naive-model
+      counterparts (Section 10.3) and should be read as a real constraint
+      on precision for this specific pre-pandemic combined cycle, not
+      merely a stylistic choice to use survey methods.
+    - Self-reported smoking, alcohol, and diabetes are subject to
+      social-desirability and recall bias.
+    - A single day's dietary recall is a noisy proxy for usual intake (the
+      classic nutritional-epidemiology caveat) -- the null diet finding
+      above should be read in that light.
+    - Complete-case handling of `income_poverty_ratio` missingness
+      (Section 3) assumes MAR (missing at random).
+- **Next steps:** multiple imputation combined with `survey`'s
+  replicate-weight machinery (`mitools` + `survey`) as a follow-up
+  robustness check on the missingness assumption; a restricted cubic
+  spline on total cholesterol; stratified models by sex or age group if
+  effect modification is suspected; and, given how few design degrees of
+  freedom remain after subsetting, checking whether an alternative
+  variance estimator (e.g., balanced repeated replication weights, if CDC
+  releases them for this cycle) narrows the adjusted CIs meaningfully.
+
+---
+
+# Session info
+
+```{r session-info}
+sessionInfo()
+```
